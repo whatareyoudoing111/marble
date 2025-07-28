@@ -1,6 +1,6 @@
 # 原作者 Pzqqt 
-# 上游代码 https://github.com/Pzqqt/android_kernel_xiaomi_marble
-# Q群 1050617767
+# [上游代码](https://github.com/Pzqqt/android_kernel_xiaomi_marble)
+# [QQ交流群 1050617767](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=eg8rrSV1jlvnwj0i8gDgJqySRJtQohEa&authKey=rND6heIn8s1T8v%2B%2FqHwCLX0cdduJeXybdr3HVwTgYQps%2BeSvmd3Kz5wO8K5pO5RN&noverify=0&group_code=1050617767)
 
 
 # How do I submit patches to Android Common Kernels
