@@ -1,5 +1,8 @@
 # 原作者 Pzqqt 
 # 上游代码 https://github.com/Pzqqt/android_kernel_xiaomi_marble
+# Q群 1050617767
+
+
 # How do I submit patches to Android Common Kernels
 
 1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.
