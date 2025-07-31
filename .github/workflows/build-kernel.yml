@@ -1,148 +1,225 @@
-name: Build Glow-Delta Kernel for Marble Device
+name: Marble Kernel Builder
 
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      kpm_patch:
+        description: "是否添加KPM修补？"
+        type: boolean
+        required: true
+        default: true
+
+env:
+  DEVICE_CODENAME: marble
+  KERNEL_NAME: Melt
+  KERNEL_REPO: Guxin12/marble_kernel
+  KERNEL_BRANCH: Glow-4LazyGoogle
+  CLANG_COMMIT: 428d18d9732aa7ebfcaed87a582d86155db878d4
+  CLANG_VERSION: r416183b
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120  # 增加超时时间
-
-    env:
-      DEVICE_CODENAME: marble
-      KERNEL_NAME: Glow-Delta
-      # 关键修复：使用临时目录作为ccache路径，避免权限问题
-      CCACHE_DIR: /tmp/ccache
-      CCACHE_COMPRESS: 1  # 启用压缩节省空间
-
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    
     steps:
-    - name: 🚀 Checkout Kernel Source
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-        path: kernel_source
-        fetch-depth: 0  # 获取完整提交历史
+      - name: 🧰 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libncurses-dev bison flex libssl-dev libelf-dev \
+            git curl unzip bc python3 make gcc g++ patch rsync kmod cpio \
+            liblz4-tool lz4 xxd  # 添加更多内核编译常用工具
 
-    - name: 📦 Install Build Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          git flex bison build-essential libncurses-dev libssl-dev bc \
-          ccache rsync zlib1g-dev python3-minimal libelf-dev libxml2-utils \
-          gnupg wget unzip lz4 cpio kmod liblz4-tool
+      - name: 📥 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_BRANCH }}
+          path: kernel
+          fetch-depth: 0  # 获取完整提交历史
+
+      - name: ⚙️ 设置Clang工具链
+        run: |
+          mkdir -p clang
+          echo "下载Clang工具链..."
+          curl -L -o clang/clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${{ env.CLANG_COMMIT }}/clang-${{ env.CLANG_VERSION }}.tar.gz" || {
+            echo "Clang下载失败!"
+            exit 1
+          }
+          tar -zxf clang/clang.tar.gz -C clang
+          rm clang/clang.tar.gz  # 清理压缩包
           
-        # 安装最新版ccache并配置
-        sudo apt-get install -y ccache
-        echo "Max cache size = 2.0G" | sudo tee -a /etc/ccache.conf
-        sudo chmod 777 /tmp  # 确保临时目录可写
-        ccache -s  # 显示ccache初始状态
+          # 设置环境变量
+          echo "CLANG_PATH=$(pwd)/clang/bin" >> $GITHUB_ENV
+          echo "PATH=$CLANG_PATH:$PATH" >> $GITHUB_ENV
 
-    - name: ⚙️ Setup Android Clang Toolchain
-      uses: kdrag0n/android-toolchains-action@v1
-      with:
-        version: r487747b # 2024年稳定版本
-        target: aarch64-linux-android
-        install-dir: /tmp/toolchain  # 使用临时目录避免权限问题
-
-    - name: 🛠️ Configure Build Environment
-      run: |
-        echo "ARCH=arm64" >> $GITHUB_ENV
-        echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
-        echo "CC=clang" >> $GITHUB_ENV
-        echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        
-        # 关键修复：使用正确的工具链路径
-        echo "PATH=/tmp/toolchain/bin:$PATH" >> $GITHUB_ENV
-        
-        # 获取精确的git描述用于版本
-        KERNEL_VERSION=$(git -C kernel_source describe --always --dirty --tags)
-        echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
-        echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> $GITHUB_ENV
-        
-        # 配置ccache环境变量
-        echo "USE_CCACHE=1" >> $GITHUB_ENV
-        echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-        mkdir -p $CCACHE_DIR
-        chmod 777 $CCACHE_DIR  # 确保ccache目录可写
-
-    - name: 🧹 Clean Previous Build
-      run: |
-        make O=out clean && make O=out mrproper
-        # 清除旧的缓存锁文件
-        find $CCACHE_DIR -name '*.lock' -exec rm -f {} +
-      working-directory: ./kernel_source
-
-    - name: ⚙️ Configure Kernel (defconfig)
-      run: |
-        # 关键修复：使用显式绝对路径指定编译器
-        make O=out CC="ccache clang" ${DEVICE_CODENAME}_defconfig
-      working-directory: ./kernel_source
-      env:
-        DEVICE_CODENAME: ${{ env.DEVICE_CODENAME }}
-
-    - name: 🔨 Build Kernel Image
-      run: |
-        # 关键优化：添加详细日志输出用于调试
-        echo "Starting kernel build with $(nproc --all) jobs"
-        echo "Current PATH: $PATH"
-        echo "CCACHE_DIR contents:"
-        ls -l $CCACHE_DIR
-        ccache -s
-        
-        # 实际编译命令
-        time make -j$(nproc --all) O=out \
-          CC="ccache clang" \
-          ARCH=arm64 \
-          CROSS_COMPILE=aarch64-linux-android- \
-          HOSTCC="gcc"  # 修复host工具链问题
+      - name: ⚡ 应用SUSFS补丁
+        working-directory: ./kernel
+        run: |
+          echo "搜索SUSFS补丁文件..."
+          PATCH_FILE=$(find . -name '50_add_susfs_in_gki-*.patch' | head -n 1)
           
-        ccache -s  # 显示缓存统计
-      working-directory: ./kernel_source
-      timeout-minutes: 90
+          if [ -z "$PATCH_FILE" ]; then
+            echo "警告：未找到SUSFS补丁文件"
+          else
+            echo "应用SUSFS补丁: $PATCH_FILE"
+            patch -p1 --fuzz=3 < $PATCH_FILE || {
+              echo "SUSFS补丁应用失败!"
+              exit 1
+            }
+            rm $PATCH_FILE  # 删除补丁文件
+            echo "SUSFS补丁应用成功"
+          fi
 
-    - name: 📥 Prepare AnyKernel3
-      uses: actions/checkout@v4
-      with:
-        repository: osm0sis/AnyKernel3
-        path: AnyKernel3
-        ref: master
+      - name: 🔨 编译内核
+        id: build_kernel
+        working-directory: ./kernel
+        run: |
+          # 设置编译环境
+          export ARCH=arm64
+          export KBUILD_BUILD_HOST="GitHubActions"
+          export KBUILD_BUILD_USER=${{ env.KERNEL_NAME }}
+          export LLVM=1
+          export LLVM_IAS=1
+          
+          # 清理构建环境
+          make O=out mrproper
+          
+          # 配置内核
+          make O=out ${{ env.DEVICE_CODENAME }}_defconfig
+          
+          # 添加内核版本信息
+          echo "CONFIG_LOCALVERSION=\"-${{ env.KERNEL_NAME }}\"" >> out/.config
+          
+          # 编译内核
+          make -j$(nproc --all) O=out 2>&1 | tee build.log
+          
+          # 验证编译结果
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "❌ 内核编译失败!"
+            grep -i "error" build.log
+            exit 1
+          fi
+          
+          # 获取内核信息
+          BUILD_VERSION=$(make -s kernelversion O=out)
+          BUILD_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          
+          # 设置输出变量
+          echo "KERNEL_VERSION=$BUILD_VERSION" >> $GITHUB_ENV
+          echo "BUILD_TIMESTAMP=$BUILD_TIMESTAMP" >> $GITHUB_ENV
+          echo "IMAGE_PATH=$(pwd)/out/arch/arm64/boot/Image" >> $GITHUB_ENV
+          echo "ARTIFACT_PREFIX=original" >> $GITHUB_ENV
+          
+          echo "✅ 内核编译成功! 版本: $BUILD_VERSION"
 
-    - name: 📦 Package Kernel
-      run: |
-        # 关键修复：确保输出文件存在
-        echo "Checking kernel build artifacts:"
-        ls -l out/arch/arm64/boot/
-        
-        # 为Marble设备使用正确的内核格式
-        KERNEL_IMAGE=out/arch/arm64/boot/Image.lz4
-        DTBO_IMAGE=out/arch/arm64/boot/dtbo.img
-        
-        if [ ! -f $KERNEL_IMAGE ]; then
-          echo "Error: Kernel image not found at $KERNEL_IMAGE!"
-          exit 1
-        fi
-        
-        cp $KERNEL_IMAGE AnyKernel3/
-        [ -f $DTBO_IMAGE ] && cp $DTBO_IMAGE AnyKernel3/
-        
-        # 更新AnyKernel配置
-        echo "device.name1=$DEVICE_CODENAME" >> AnyKernel3/anykernel.sh
-        echo "kernel.string=$KERNEL_NAME v${{ env.KERNEL_VERSION }}" >> AnyKernel3/anykernel.sh
-        echo "do.devicecheck=0" >> AnyKernel3/anykernel.sh  # 禁用设备检查
-        
-        # 创建刷机包
-        cd AnyKernel3
-        zip -r9 ../${KERNEL_NAME}-${DEVICE_CODENAME}-${{ env.BUILD_DATE }}.zip *
-        
-        # 验证文件大小
-        echo "Final ZIP file:"
-        ls -lh ../*.zip
+      - name: ⚡ KPM修补 (可选)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.kpm_patch == true }}
+        working-directory: ./kernel/out/arch/arm64/boot
+        run: |
+          echo "执行KPM修补..."
+          
+          # 下载KPM修补工具
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/main/kpm/patch_linux" -o patch || {
+            echo "无法下载KPM修补工具"
+            exit 1
+          }
+          chmod +x patch
+          
+          # 执行修补
+          ./patch || {
+            echo "KPM修补失败"
+            exit 1
+          }
+          
+          # 替换原始内核镜像
+          if [ -f "oImage" ]; then
+            mv oImage Image
+            echo "ARTIFACT_PREFIX=kpm-patched" >> $GITHUB_ENV
+            echo "✅ KPM修补成功完成"
+          else
+            echo "❌ KPM修补失败: oImage未生成"
+            exit 1
+          fi
 
-    - name: ⬆️ Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ env.KERNEL_NAME }}-${{ env.DEVICE_CODENAME }}-${{ env.BUILD_DATE }}
-        path: ${{ env.KERNEL_NAME }}-${{ env.DEVICE_CODENAME }}-*.zip
-        retention-days: 7
+      - name: 📦 准备AnyKernel3刷机包
+        run: |
+          echo "准备AnyKernel3刷机包..."
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          
+          # 创建自定义anykernel.sh
+          cat > AnyKernel3/anykernel.sh <<'EOF'
+          #!/bin/sh
+          ## AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+          
+          properties() {
+            kernel.string=${{ env.KERNEL_NAME }} by Guxin12 @酷安初春在路野
+            do.devicecheck=1
+            do.modules=0
+            do.systemless=1
+            do.cleanup=1
+            do.cleanuponabort=0
+            device.name1=marble
+            device.name2=marblein
+            supported.versions=14
+          }
+          
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          
+          . tools/ak3-core.sh;
+          
+          if [ -L "/dev/block/bootdevice/by-name/init_boot_a" -o -L "/dev/block/by-name/init_boot_a" ]; then
+              split_boot;
+              flash_boot;
+          else
+              dump_boot;
+              write_boot;
+          fi;
+          EOF
+          
+          # 设置权限
+          chmod +x AnyKernel3/anykernel.sh
+          
+          # 复制内核镜像
+          cp ${{ env.IMAGE_PATH }} AnyKernel3/
+          
+          # 可选：复制其他文件如dtbo.img
+          if [ -f "kernel/out/arch/arm64/boot/dtbo.img" ]; then
+            cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
+          fi
+
+      - name: 📦 打包刷机包
+        run: |
+          ZIP_NAME="${{ env.KERNEL_NAME }}-${{ env.DEVICE_CODENAME }}-v${{ env.KERNEL_VERSION }}-${{ env.BUILD_TIMESTAMP }}"
+          ZIP_NAME="$ZIP_NAME-${{ env.ARTIFACT_PREFIX }}.zip"
+          
+          cd AnyKernel3
+          zip -r9 ../$ZIP_NAME *
+          
+          echo "ZIP_PATH=$(pwd)/../$ZIP_NAME" >> $GITHUB_ENV
+          echo "✅ 刷机包生成: $ZIP_NAME"
+
+      - name: 📤 上传构建成果
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-${{ env.DEVICE_CODENAME }}-v${{ env.KERNEL_VERSION }}-${{ env.BUILD_TIMESTAMP }}
+          path: |
+            ${{ env.IMAGE_PATH }}
+            ${{ env.ZIP_PATH }}
+            kernel/build.log
+          retention-days: 7
+          
+      - name: 💬 完成通知
+        if: success()
+        run: |
+          echo "✅ ${{ env.KERNEL_NAME }} 内核编译完成!"
+          echo "设备: ${{ env.DEVICE_CODENAME }}"
+          echo "版本: ${{ env.KERNEL_VERSION }}"
+          echo "类型: ${{ env.ARTIFACT_PREFIX }}"
+          echo "时间: ${{ env.BUILD_TIMESTAMP }}"
+          echo "镜像大小: $(du -h ${{ env.IMAGE_PATH }} | awk '{print $1}')"
+          echo "刷机包大小: $(du -h ${{ env.ZIP_PATH }} | awk '{print $1}')"
