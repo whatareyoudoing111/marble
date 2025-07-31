@@ -25,7 +25,8 @@ jobs:
       run: |
         sudo apt update
         # 安装编译 Android 内核所需的常见软件包
-        sudo apt install -y git flex bison build-essential libncurses-dev libssl-dev bc ccache rsync zlib1g-dev python3-minimal libelf-dev libxml2-utils gnupg realpath wget unzip
+        # 已移除 'realpath'，因为它在当前环境中可能不需要或不可用
+        sudo apt install -y git flex bison build-essential libncurses-dev libssl-dev bc ccache rsync zlib1g-dev python3-minimal libelf-dev libxml2-utils gnupg wget unzip
 
     - name: Download & Setup Android NDK (Clang Toolchain)
       run: |
@@ -111,9 +112,15 @@ jobs:
         # 根据你的信息，最终产物是 Image.gz-dtb
         cp kernel_source/arch/arm64/boot/Image.gz-dtb AnyKernel3/
         
+        # <<< !!! 可选，但可能需要根据你的设备和内核配置调整 !!! >>>
         # 如果你的设备需要单独的 dtb.img 并且内核会生成它，在这里复制。
         # 如果 Image.gz-dtb 已经包含了 DTB，则此行无需。
-        # 例如: cp kernel_source/arch/arm64/boot/dtb.img AnyKernel3/
+        # 示例：cp kernel_source/arch/arm64/boot/dtb.img AnyKernel3/
+        # 另一个常见情况：如果内核编译生成的是 Image 而不是 Image.gz-dtb，你需要手动提取DTB
+        # 例如：
+        # cd AnyKernel3 
+        # ./anykernel.sh --extract-dtb ../kernel_source/arch/arm64/boot/Image # 假设 Image 是原始内核文件
+        # cd ..
 
         # 清理 AnyKernel3 中可能不需要的占位符文件
         rm -f AnyKernel3/Image.gz-dtb-placeholder AnyKernel3/zImage AnyKernel3/boot.img
@@ -131,6 +138,7 @@ jobs:
         echo "zipname=GlowDelta-Kernel-${KERNEL_VERSION}-${BUILD_DATE}-${{ github.run_number }}.zip" >> AnyKernel3/anykernel.sh
         
         # 验证关键文件是否已复制到 AnyKernel3 目录
+        echo "Content of AnyKernel3/ folder after copying kernel:"
         ls -l AnyKernel3/
 
     - name: Package Kernel with AnyKernel3
@@ -148,20 +156,22 @@ jobs:
         GENERATED_ZIP_NAME=$(sed -n 's/^zipname=//p' AnyKernel3/anykernel.sh)
         
         # 查找实际生成的 zip 文件
-        if [ -f "${GENERATED_ZIP_NAME}" ]; then
-            echo "Found generated zip in root: ${GENERATED_ZIP_NAME}"
-            echo "OLD_ZIP_NAME=${GENERATED_ZIP_NAME}" >> $GITHUB_OUTPUT
-        elif [ -f "AnyKernel3/${GENERATED_ZIP_NAME}" ]; then
+        # 首先检查 AnyKernel3 目录下
+        if [ -f "AnyKernel3/${GENERATED_ZIP_NAME}" ]; then
             echo "Found generated zip in AnyKernel3 folder: AnyKernel3/${GENERATED_ZIP_NAME}"
             echo "OLD_ZIP_NAME=AnyKernel3/${GENERATED_ZIP_NAME}" >> $GITHUB_OUTPUT
+        # 然后检查工作区根目录
+        elif [ -f "${GENERATED_ZIP_NAME}" ]; then
+            echo "Found generated zip in root: ${GENERATED_ZIP_NAME}"
+            echo "OLD_ZIP_NAME=${GENERATED_ZIP_NAME}" >> $GITHUB_OUTPUT
         else
-            # 备用查找方式，以防 AnyKernel3 行为变化
+            # 备用查找方式，以防 AnyKernel3 行为变化（查找最新的以 "GlowDelta-Kernel-" 开头的zip）
             LATEST_ZIP=$(find . -name "GlowDelta-Kernel-*.zip" -type f -print | sort -r | head -n 1)
             if [ -f "${LATEST_ZIP}" ]; then
                 echo "Found latest zip using wildcard: ${LATEST_ZIP}"
                 echo "OLD_ZIP_NAME=${LATEST_ZIP}" >> $GITHUB_OUTPUT
             else
-                echo "Error: Could not find the generated zip file after packaging!"
+                echo "Error: Could not find the generated zip file after packaging! Please check AnyKernel3 output."
                 exit 1
             fi
         fi
@@ -172,6 +182,7 @@ jobs:
 
         # 重命名文件，以便 Actions 能够找到并上传
         mv "${{ steps.get_zip_name.outputs.OLD_ZIP_NAME }}" "${{ steps.get_zip_name.outputs.NEW_ZIP_NAME }}"
+        echo "Renamed zip file to: ${NEW_ZIP_NAME}"
         ls -l # 再次列出文件，确认重命名成功
 
       working-directory: ./ # 在工作区根目录执行查找和重命名
