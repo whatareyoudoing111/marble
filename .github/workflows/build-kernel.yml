@@ -1,195 +1,224 @@
 name: Build Glow-Delta Kernel for Marble Device
 
-# 定义何时触发此工作流
+# 当代码推送到 main/master 分支或手动触发时，运行此工作流
 on:
   push:
     branches:
-      - main # 当有代码推送到 main 分支时触发
-      - master # 如果你的主分支是 master，也加上
-  workflow_dispatch: # 允许你手动从 GitHub Actions 页面运行此工作流
+      - main
+      - master
+  workflow_dispatch:
 
 jobs:
   build:
-    # 指定工作流运行在最新的 Ubuntu 虚拟机上
+    # 在最新的 Ubuntu 虚拟机上执行构建任务
     runs-on: ubuntu-latest
+    # 设置构建环境的超时时间，防止长时间卡死
+    timeout-minutes: 90
 
-    # 步骤列表
     steps:
-    - name: Checkout Kernel Source
-      uses: actions/checkout@v4 # 使用 actions/checkout@v4 来拉取你的仓库代码
+    - name: 🚀 Checkout Kernel Source
+      uses: actions/checkout@v4
       with:
-        submodules: true # Glow-Delta 通常有子模块，确保它们被克隆
-        path: kernel_source # 将内核源代码克隆到 'kernel_source' 目录，避免和AnyKernel3冲突
+        # 递归克隆所有子模块，Glow-Delta 通常会用到
+        submodules: true
+        # 将内核源码克隆到 'kernel_source' 目录，与 AnyKernel3 目录分离
+        path: kernel_source
 
-    - name: Install Build Dependencies
+    - name: 📦 Install Build Dependencies
       run: |
+        echo "Updating apt package list..."
         sudo apt update
-        # 安装编译 Android 内核所需的常见软件包
-        # 已移除 'realpath'，因为它在当前环境中可能不需要或不可用
-        sudo apt install -y git flex bison build-essential libncurses-dev libssl-dev bc ccache rsync zlib1g-dev python3-minimal libelf-dev libxml2-utils gnupg wget unzip
+        echo "Installing essential build tools and libraries..."
+        # 包含了编译 Android 内核所需的常用软件包
+        # realpath 已经移除，因为它在最新环境中可能不再需要或存在兼容性问题
+        sudo apt install -y \
+          git flex bison build-essential libncurses-dev libssl-dev bc \
+          ccache rsync zlib1g-dev python3-minimal libelf-dev libxml2-utils \
+          gnupg wget unzip
 
-    - name: Download & Setup Android NDK (Clang Toolchain)
+    - name: ⚙️ Download & Setup Android NDK (Clang Toolchain)
       run: |
-        # NDK 版本选择：r25c, r26c, r27b 都是常见选项。
-        # 如果编译失败，或者内核文档推荐特定版本，请修改这里。
+        # --- !!! 请根据内核要求调整 NDK 版本 !!! ---
+        # 推荐使用 r25c, r26c, r27b 等稳定版本。如果编译失败，尝试更换 NDK 版本。
         NDK_VERSION="r26c" 
         NDK_FILE="android-ndk-${NDK_VERSION}-linux.zip"
         NDK_URL="https://dl.google.com/android/repository/${NDK_FILE}"
 
-        echo "Downloading NDK from: ${NDK_URL}"
-        wget "${NDK_URL}" -O /tmp/${NDK_FILE}
-        unzip /tmp/${NDK_FILE} -d ~/android-ndk-temp/
+        echo "Attempting to download NDK from: ${NDK_URL}"
+        wget "${NDK_URL}" -O /tmp/${NDK_FILE} || { echo "Failed to download NDK!"; exit 1; }
+        echo "Extracting NDK..."
+        unzip -q /tmp/${NDK_FILE} -d ~/android-ndk-temp/ || { echo "Failed to extract NDK!"; exit 1; }
         
-        # 查找 NDK 中 Clang 工具链的实际路径
-        # 示例: ~/android-ndk-temp/android-ndk-r26c/toolchains/llvm/prebuilt/linux-x86_64/bin
-        export TOOLCHAIN_DIR=$(find ~/android-ndk-temp/android-ndk-${NDK_VERSION}/toolchains/llvm -name 'linux-x86_64' -type d | head -n 1)/bin
+        # 动态查找 Clang 工具链的精确路径
+        # 通常位于 toolchains/llvm/prebuilt/linux-x86_64/bin
+        # 使用 'head -n 1' 确保只取第一个结果
+        TOOLCHAIN_ROOT_DIR=$(find ~/android-ndk-temp/android-ndk-${NDK_VERSION}/toolchains/llvm -name 'linux-x86_64' -type d | head -n 1)
+        export TOOLCHAIN_DIR="${TOOLCHAIN_ROOT_DIR}/bin"
         
-        if [ -z "$TOOLCHAIN_DIR" ]; then
-          echo "Error: Could not find NDK toolchain directory for version ${NDK_VERSION}."
-          echo "Please check NDK_VERSION or the structure of the NDK archive."
+        if [ -z "$TOOLCHAIN_ROOT_DIR" ] || [ ! -d "$TOOLCHAIN_DIR" ]; then
+          echo "Error: NDK toolchain directory not found for version ${NDK_VERSION}." 1>&2
+          echo "Please verify the NDK_VERSION and NDK archive structure." 1>&2
           exit 1
         fi
 
-        echo "TOOLCHAIN_DIR found at: ${TOOLCHAIN_DIR}"
-        # 将工具链路径添加到 PATH 环境变量，供 make 命令找到编译器
+        echo "NDK Toolchain found at: ${TOOLCHAIN_DIR}"
+        # 将工具链路径添加到 PATH 环境变量，这样 make 命令才能找到 clang/ld 等工具
         echo "PATH=${TOOLCHAIN_DIR}:${PATH}" >> $GITHUB_ENV
-        
-        # 某些内核的 Makefile 可能需要这个环境变量
+        # 设置 KERNEL_TOOLCHAIN 环境变量，部分内核 Makefile 可能需要
         echo "KERNEL_TOOLCHAIN=${TOOLCHAIN_DIR}" >> $GITHUB_ENV
         
-        # 移除临时 NDK 文件以节省空间
+        # 清理临时 NDK 文件，节省磁盘空间
+        echo "Cleaning up temporary NDK archive..."
         rm /tmp/${NDK_FILE}
 
-    - name: Set Environment Variables for Kernel Build
+    - name: 🛠️ Set Kernel Build Environment Variables & Setup CCACHE
       run: |
-        # 设置 ARCH (架构) 和 SUBARCH 为 arm64
+        echo "Setting up ARCH, SUBARCH, and CROSS_COMPILE..."
         echo "ARCH=arm64" >> $GITHUB_ENV
         echo "SUBARCH=arm64" >> $GITHUB_ENV
-        
-        # 设置交叉编译前缀，Android 内核通常使用这个前缀
         echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
-        
-        # 某些内核也可能查找 CROSS_COMPILE_ARM64
-        echo "CROSS_COMPILE_ARM64=aarch64-linux-android-" >> $GITHUB_ENV
-        
-        # 设置编译用户信息 (可选，编译信息中会显示你的名字和主机名)
+        echo "CROSS_COMPILE_ARM64=aarch64-linux-android-" >> $GITHUB_ENV # 部分内核需要
+
+        echo "Setting KBUILD build user and host info..."
         echo "KBUILD_BUILD_USER=GitHubActions" >> $GITHUB_ENV
         echo "KBUILD_BUILD_HOST=GitHub" >> $GITHUB_ENV
         
-        # 启用 ccache (可选，加速重复编译，对 CI 很有用)
+        echo "Configuring ccache..."
+        # 设置 ccache 目录
         echo "CCACHE_DIR=/github/workspace/.ccache" >> $GITHUB_ENV
+        # 找到 ccache 可执行文件的路径
         echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
+        # 启用 ccache
         echo "USE_CCACHE=1" >> $GITHUB_ENV
+        
+        # 确保 ccache 目录存在并具有写入权限，解决 "Permission denied" 错误
+        mkdir -p "${{ github.workspace }}/.ccache" || { echo "Failed to create ccache directory!"; exit 1; }
+        chmod 777 "${{ github.workspace }}/.ccache" || { echo "Failed to set permissions for ccache directory!"; exit 1; }
+        echo "CCACHE directory created and permissions set: ${{ github.workspace }}/.ccache"
 
-    - name: Configure Kernel for Marble
+    - name: ⚙️ Configure Kernel (defconfig)
       run: |
+        echo "Configuring kernel with marble_defconfig..."
         # 使用 'marble_defconfig' 作为你的设备配置文件
-        # 根据你提供的图片，这是正确的文件名
-        make marble_defconfig 
-      working-directory: ./kernel_source # 确保在 'kernel_source' 目录中执行 make
+        # 确保此文件存在于 kernel_source/arch/arm64/configs/
+        make O=out marble_defconfig || { echo "Failed to configure kernel with marble_defconfig!"; exit 1; }
+        # 对于 Android 内核，通常推荐使用 'O=out' 将构建输出重定向到单独的目录
+        # 这样可以保持源代码树的清洁
+      working-directory: ./kernel_source
 
-    - name: Build Kernel
+    - name: 🔨 Build Kernel Image
       run: |
-        # 使用所有可用的 CPU 核心进行并行编译，加快速度
-        make -j$(nproc --all)
-      working-directory: ./kernel_source # 确保在 'kernel_source' 目录中执行 make
+        echo "Starting kernel compilation..."
+        # 使用所有可用的 CPU 核心进行并行编译
+        # 使用 'make O=out' 确保在指定输出目录中进行编译
+        make O=out -j$(nproc --all) || { echo "Kernel compilation failed!"; exit 1; }
+      working-directory: ./kernel_source
 
-    - name: Checkout AnyKernel3
+    - name: 📥 Checkout AnyKernel3
       uses: actions/checkout@v4
       with:
-        # <<< !!! 关键修改 !!! >>>
+        # --- !!! 关键配置：请替换为你的 AnyKernel3 仓库地址 !!! ---
         # 强烈建议你 Fork osm0sis/AnyKernel3 到你自己的 GitHub 账号下，
         # 然后将 'osm0sis/AnyKernel3' 替换为 '你的用户名/AnyKernel3'。
         # 例如: 'Guxin12/AnyKernel3'
         repository: osm0sis/AnyKernel3 
-        # 通常 AnyKernel3 的主分支是 'master' 或 'main'
+        # AnyKernel3 的分支，通常是 'master' 或 'main'
         ref: master 
-        path: AnyKernel3 # 将 AnyKernel3 克隆到 'AnyKernel3' 目录
+        # 将 AnyKernel3 克隆到 'AnyKernel3' 目录
+        path: AnyKernel3 
 
-    - name: Prepare AnyKernel3 for Packaging
+    - name: 📦 Prepare AnyKernel3 for Packaging
       run: |
+        echo "Preparing AnyKernel3 for packaging..."
         # 复制编译好的内核镜像到 AnyKernel3 目录
         # 根据你的信息，最终产物是 Image.gz-dtb
-        cp kernel_source/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+        # 确保路径 'kernel_source/out/arch/arm64/boot/Image.gz-dtb' 是正确的
+        # 因为我们在 'Configure Kernel' 和 'Build Kernel' 中使用了 'O=out'
+        cp kernel_source/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/ || { echo "Failed to copy Image.gz-dtb!"; exit 1; }
         
-        # <<< !!! 可选，但可能需要根据你的设备和内核配置调整 !!! >>>
+        # --- !!! 可选，但可能需要根据你的设备和内核配置调整 !!! ---
         # 如果你的设备需要单独的 dtb.img 并且内核会生成它，在这里复制。
         # 如果 Image.gz-dtb 已经包含了 DTB，则此行无需。
-        # 示例：cp kernel_source/arch/arm64/boot/dtb.img AnyKernel3/
+        # 例如：cp kernel_source/out/arch/arm64/boot/dtb.img AnyKernel3/ || { echo "Failed to copy dtb.img!"; exit 1; }
         # 另一个常见情况：如果内核编译生成的是 Image 而不是 Image.gz-dtb，你需要手动提取DTB
         # 例如：
         # cd AnyKernel3 
-        # ./anykernel.sh --extract-dtb ../kernel_source/arch/arm64/boot/Image # 假设 Image 是原始内核文件
+        # ./anykernel.sh --extract-dtb ../kernel_source/out/arch/arm64/boot/Image || { echo "Failed to extract dtb!"; exit 1; }
         # cd ..
 
-        # 清理 AnyKernel3 中可能不需要的占位符文件
+        # 清理 AnyKernel3 中可能不需要的占位符文件，确保我们自己的文件生效
         rm -f AnyKernel3/Image.gz-dtb-placeholder AnyKernel3/zImage AnyKernel3/boot.img
         
         # 获取内核版本信息，并更新 AnyKernel3 的 zip 文件名和内核识别字符串
         # 这些信息会显示在刷机时（TWRP）或生成的刷机包名称中
-        # 'kernelversion' 是 Makefile 中的一个目标，用于获取内核版本字符串
         KERNEL_VERSION=$(cd kernel_source && make kernelversion)
         BUILD_DATE=$(date +%Y%m%d)
         BUILD_TIME=$(date +%H%M)
         
+        echo "Setting kernel.string and zipname in AnyKernel3/anykernel.sh..."
         # 将内核识别字符串写入 anykernel.sh
         echo "kernel.string=GlowDelta-Kernel-${KERNEL_VERSION}-${BUILD_DATE}-${BUILD_TIME}-${{ github.sha_short }}" >> AnyKernel3/anykernel.sh
         # 设置最终的卡刷包文件名
         echo "zipname=GlowDelta-Kernel-${KERNEL_VERSION}-${BUILD_DATE}-${{ github.run_number }}.zip" >> AnyKernel3/anykernel.sh
         
         # 验证关键文件是否已复制到 AnyKernel3 目录
-        echo "Content of AnyKernel3/ folder after copying kernel:"
+        echo "Contents of AnyKernel3/ folder after kernel copy and cleanup:"
         ls -l AnyKernel3/
 
-    - name: Package Kernel with AnyKernel3
+    - name: ⚙️ Package Kernel with AnyKernel3
       run: |
+        echo "Running AnyKernel3 packaging script..."
         # 执行 AnyKernel3 的打包脚本，生成最终的 .zip 文件
         # AnyKernel3 的 '--build-zip' 命令会自动处理打包和命名
-        bash anykernel.sh --build-zip
+        bash anykernel.sh --build-zip || { echo "AnyKernel3 packaging failed!"; exit 1; }
       working-directory: ./AnyKernel3 # 确保在 'AnyKernel3' 目录中执行打包命令
       
-    - name: Find and Rename Output Zip
-      id: get_zip_name # 给这个步骤一个ID，方便后续引用
+    - name: 🔍 Find and Rename Output Zip
+      id: get_zip_name # 给这个步骤一个ID，方便后续引用输出
       run: |
-        # AnyKernel3 的 --build-zip 默认会在当前目录或其父目录生成zip
-        # 获取 AnyKernel3 在 anykernel.sh 中定义的 zipname
-        GENERATED_ZIP_NAME=$(sed -n 's/^zipname=//p' AnyKernel3/anykernel.sh)
-        
-        # 查找实际生成的 zip 文件
-        # 首先检查 AnyKernel3 目录下
+        echo "Locating and renaming the generated zip file..."
+        # 从 AnyKernel3 的 anykernel.sh 中获取期望的 zip 文件名
+        GENERATED_ZIP_NAME=$(sed -n 's/^zipname=//p' AnyKernel3/anykernel.sh | tr -d '\r') # tr -d '\r' 处理可能存在的CRLF换行符
+
+        # 检查文件是否存在于 AnyKernel3 目录内
         if [ -f "AnyKernel3/${GENERATED_ZIP_NAME}" ]; then
-            echo "Found generated zip in AnyKernel3 folder: AnyKernel3/${GENERATED_ZIP_NAME}"
-            echo "OLD_ZIP_NAME=AnyKernel3/${GENERATED_ZIP_NAME}" >> $GITHUB_OUTPUT
-        # 然后检查工作区根目录
+            OLD_ZIP_PATH="AnyKernel3/${GENERATED_ZIP_NAME}"
+            echo "Found generated zip in AnyKernel3 folder: ${OLD_ZIP_PATH}"
+        # 检查文件是否存在于工作区根目录（AnyKernel3的父目录）
         elif [ -f "${GENERATED_ZIP_NAME}" ]; then
-            echo "Found generated zip in root: ${GENERATED_ZIP_NAME}"
-            echo "OLD_ZIP_NAME=${GENERATED_ZIP_NAME}" >> $GITHUB_OUTPUT
+            OLD_ZIP_PATH="${GENERATED_ZIP_NAME}"
+            echo "Found generated zip in root: ${OLD_ZIP_PATH}"
         else
-            # 备用查找方式，以防 AnyKernel3 行为变化（查找最新的以 "GlowDelta-Kernel-" 开头的zip）
+            # 备用查找方式：如果 AnyKernel3 的输出位置或命名规则有变，尝试泛查找
+            echo "Attempting wildcard search for zip file..."
             LATEST_ZIP=$(find . -name "GlowDelta-Kernel-*.zip" -type f -print | sort -r | head -n 1)
             if [ -f "${LATEST_ZIP}" ]; then
-                echo "Found latest zip using wildcard: ${LATEST_ZIP}"
-                echo "OLD_ZIP_NAME=${LATEST_ZIP}" >> $GITHUB_OUTPUT
+                OLD_ZIP_PATH="${LATEST_ZIP}"
+                echo "Found latest zip using wildcard: ${OLD_ZIP_PATH}"
             else
-                echo "Error: Could not find the generated zip file after packaging! Please check AnyKernel3 output."
+                echo "Error: Could not find the generated zip file after packaging! Please check AnyKernel3 output." 1>&2
                 exit 1
             fi
         fi
+
+        # 将旧的 zip 文件路径输出给下一步
+        echo "OLD_ZIP_NAME=${OLD_ZIP_PATH}" >> $GITHUB_OUTPUT
 
         # 定义新的、更清晰的上传文件名，方便下载
         NEW_ZIP_NAME="GlowDelta-Kernel-Flashable.zip"
         echo "NEW_ZIP_NAME=${NEW_ZIP_NAME}" >> $GITHUB_OUTPUT
 
-        # 重命名文件，以便 Actions 能够找到并上传
-        mv "${{ steps.get_zip_name.outputs.OLD_ZIP_NAME }}" "${{ steps.get_zip_name.outputs.NEW_ZIP_NAME }}"
+        # 重命名文件，以便 Upload Artifacts 步骤能够找到并上传
+        mv "${OLD_ZIP_PATH}" "${NEW_ZIP_NAME}" || { echo "Failed to rename zip file!"; exit 1; }
         echo "Renamed zip file to: ${NEW_ZIP_NAME}"
         ls -l # 再次列出文件，确认重命名成功
-
+        
       working-directory: ./ # 在工作区根目录执行查找和重命名
 
-    - name: Upload Flashable Zip
+    - name: ⬆️ Upload Flashable Zip
       uses: actions/upload-artifact@v4
       with:
         name: Glow-Delta-Kernel-Flashable-Zip
         path: ${{ steps.get_zip_name.outputs.NEW_ZIP_NAME }} # 上传最终的刷机包
         if-no-files-found: error # 如果找不到文件则报错
+        retention-days: 7 # 设置 Artifact 的保留天数，默认是 90 天，这里设置为 7 天
